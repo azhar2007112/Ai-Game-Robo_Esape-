@@ -291,3 +291,178 @@ def ai_decision(ai, player, board, level='easy'):
             return
     dx,dy = random.choice([(1,0),(-1,0),(0,1),(0,-1)])
     ai.move(dx,dy,board)
+
+
+
+def predict_next_move(player, board):
+    """Predict player's next tile based on last move or nearest resource."""
+    # Default: stay in place
+    predicted = player.pos  
+
+    # If player just moved recently, extrapolate direction
+    if hasattr(player, "last_pos"):
+        dx = player.pos[0] - player.last_pos[0]
+        dy = player.pos[1] - player.last_pos[1]
+        predicted = (player.pos[0] + dx, player.pos[1] + dy)
+        # keep inside bounds
+        if not (0 <= predicted[0] < board.size and 0 <= predicted[1] < board.size):
+            predicted = player.pos
+
+    # Otherwise, bias prediction toward nearest resource
+    elif board.resources:
+        closest = min(board.resources.keys(),
+                      key=lambda r: abs(r[0]-player.pos[0]) + abs(r[1]-player.pos[1]))
+        dx = (closest[0] - player.pos[0])
+        dy = (closest[1] - player.pos[1])
+        step = (player.pos[0] + (1 if dx>0 else -1 if dx<0 else 0),
+                player.pos[1] + (1 if dy>0 else -1 if dy<0 else 0))
+        predicted = step
+
+    return predicted
+
+
+
+
+def ai_vs_ai_decision(ai, opponent, board, level='medium'):
+    """Smart AI for AI vs AI mode with goals prioritized over endless melee."""
+
+    # Handle stun
+    if hasattr(ai, 'stunned_turns') and ai.stunned_turns:
+        ai.stunned_turns -= 1
+        return
+
+    # --- AUTO-GOAL DISCOVERY (important!) ---
+    # If this AI doesn't have an explicit goal, pick the farthest of the two corners.
+    # This guarantees: AI at (0,0) will choose (n-1,n-1), and vice versa.
+    if not hasattr(ai, 'goal') or ai.goal is None:
+        n = board.size
+        corners = [(0, 0), (n-1, n-1)]
+        ai.goal = max(corners, key=lambda c: abs(ai.pos[0]-c[0]) + abs(ai.pos[1]-c[1]))
+
+    goal = ai.goal
+
+    dist = ai.distance(opponent)
+    melee_range = 2
+    melee_damage = getattr(ai, 'melee_damage', 10)
+
+
+    # Track progress and last moves
+    cur_goal_dist = abs(ai.pos[0]-goal[0]) + abs(ai.pos[1]-goal[1])
+    if not hasattr(ai, '_last_goal_dist'):
+        ai._last_goal_dist = cur_goal_dist
+    if not hasattr(ai, '_no_progress_turns'):
+        ai._no_progress_turns = 0
+    if not hasattr(ai, '_last_pos'):
+        ai._last_pos = None
+    if not hasattr(ai, '_attack_cooldown'):
+        ai._attack_cooldown = 0
+
+    if cur_goal_dist >= ai._last_goal_dist:
+        ai._no_progress_turns += 1
+    else:
+        ai._no_progress_turns = 0
+
+    # 1) Lethal strike (always finish enemy if possible)
+    if dist <= melee_range and opponent.health <= melee_damage:
+        ai.attack(opponent)
+        ai._attack_cooldown = 1
+        ai._last_goal_dist = cur_goal_dist
+        ai._last_pos = ai.pos
+        return
+
+    # 2) If in melee range but we already attacked last turn → move instead
+    if dist <= melee_range:
+        if ai._attack_cooldown > 0:
+            ai._attack_cooldown -= 1
+            path = a_star(ai.pos, goal, board)
+            if path:
+                next_step = path[0]
+                # ✅ avoid oscillation: don’t step back into last_pos
+                if ai._last_pos and next_step == ai._last_pos:
+                    # try alternate directions
+                    moves = [(1,0),(-1,0),(0,1),(0,-1)]
+                    random.shuffle(moves)
+                    moved = False
+                    for dx,dy in moves:
+                        nx, ny = ai.pos[0]+dx, ai.pos[1]+dy
+                        if (0 <= nx < board.size and 0 <= ny < board.size 
+                            and board.grid[nx][ny] != "X" 
+                            and (nx,ny) != ai._last_pos):
+                            ai.move(dx, dy, board)
+                            moved = True
+                            break
+                    if not moved:  # fallback if stuck
+                        dx, dy = random.choice(moves)
+                        ai.move(dx, dy, board)
+                else:
+                    dx, dy = next_step[0]-ai.pos[0], next_step[1]-ai.pos[1]
+                    ai.move(dx, dy, board)
+                ai._last_goal_dist = abs(ai.pos[0]-goal[0]) + abs(ai.pos[1]-goal[1])
+                ai._last_pos = ai.pos
+                return
+        else:
+            # Attack once, then set cooldown so we won’t repeat
+            ai.attack(opponent)
+            ai._attack_cooldown = 1
+            ai._last_goal_dist = cur_goal_dist
+            ai._last_pos = ai.pos
+            return
+
+    # 3) Ranged harassment
+    if 3 <= dist <= 5 and getattr(ai, 'ranged_cooldown', 0) == 0:
+        ai.pending_ranged = {'target_pos': opponent.pos, 'turns': 1}
+        ai.ranged_cooldown = 3
+        ai._last_goal_dist = cur_goal_dist
+        ai._last_pos = ai.pos
+        return
+    else:
+        if getattr(ai, 'ranged_cooldown', 0) > 0:
+            ai.ranged_cooldown -= 1
+
+    # 4) Path to goal
+    chosen_step = None
+    pg = a_star(ai.pos, goal, board)
+    if pg:
+        chosen_step = pg[0]
+
+    # Opportunistic resource
+    if board.resources:
+        nearest = min(board.resources, key=lambda r: abs(ai.pos[0]-r[0]) + abs(ai.pos[1]-r[1]))
+        pr = a_star(ai.pos, nearest, board)
+        if pr:
+            step_r = pr[0]
+            if (chosen_step is None or
+                (abs(step_r[0]-goal[0]) + abs(step_r[1]-goal[1])
+                 <= abs(chosen_step[0]-goal[0]) + abs(chosen_step[1]-goal[1]))):
+                chosen_step = step_r
+
+    # 5) Execute movement (anti-oscillation here too)
+    if chosen_step:
+        if ai._last_pos and chosen_step == ai._last_pos:
+            # choose alternative direction
+            moves = [(1,0),(-1,0),(0,1),(0,-1)]
+            random.shuffle(moves)
+            for dx,dy in moves:
+                nx, ny = ai.pos[0]+dx, ai.pos[1]+dy
+                if (0 <= nx < board.size and 0 <= ny < board.size 
+                    and board.grid[nx][ny] != "X" 
+                    and (nx,ny) != ai._last_pos):
+                    ai.move(dx, dy, board)
+                    ai._last_pos = ai.pos
+                    ai._last_goal_dist = abs(ai.pos[0]-goal[0]) + abs(ai.pos[1]-goal[1])
+                    return
+            # fallback
+            dx, dy = random.choice(moves)
+            ai.move(dx, dy, board)
+        else:
+            dx, dy = chosen_step[0]-ai.pos[0], chosen_step[1]-ai.pos[1]
+            ai.move(dx, dy, board)
+        ai._last_goal_dist = abs(ai.pos[0]-goal[0]) + abs(ai.pos[1]-goal[1])
+        ai._last_pos = ai.pos
+        return
+
+    # 6) Fallback random move
+    dx, dy = random.choice([(1,0),(-1,0),(0,1),(0,-1)])
+    ai.move(dx, dy, board)
+    ai._last_goal_dist = cur_goal_dist
+    ai._last_pos = ai.pos
